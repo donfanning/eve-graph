@@ -1,0 +1,160 @@
+#!/usr/bin/python3
+"""
+Copyright(C) 2016, Eric Leblond
+Written by Eric Leblond <eric@regit.org>
+
+DOM is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+DOM is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with DOM.  If not, see <http://www.gnu.org/licenses/>.
+"""
+
+import argparse
+import logging
+import os
+import time
+import json
+import re
+from graph_tool.all import *
+from graph_tool.topology import transitive_closure
+import ipaddress
+
+ips_hash = {}
+
+parser = argparse.ArgumentParser(description='Path le chien')
+parser.add_argument('-f', '--file', default='/var/log/suricata/eve.json', help='JSON file to monitor')
+parser.add_argument('-v', '--verbose', default=False, action="count", help="Show verbose output, use multiple times increase verbosity")
+parser.add_argument('-l', '--log', default=None, help='File to log output to (default to stdout)')
+parser.add_argument('-m', '--metadata', default=False, action="store_true", help="Use alert source and target instead of raw IPs")
+parser.add_argument('-b', '--batch', default=False, action="store_true", help="Run in batch mode on a file")
+
+args = parser.parse_args()
+
+if args.verbose >= 3:
+    loglevel=logging.DEBUG
+elif args.verbose >= 2:
+    loglevel=logging.INFO
+elif args.verbose >= 1:
+    loglevel=logging.WARNING
+else:
+    loglevel=logging.ERROR
+
+
+HOME_NET_STR = ["10.0.0.0/8"]
+
+def setup_logging(args):
+    if args.log:
+        logging.basicConfig(filename=args.log,
+                            format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
+                            level=loglevel)
+    else:
+        logging.basicConfig(level=loglevel)
+
+class AlertGraph(Graph):
+    def __init__(self, *args, **kwargs):
+        super(AlertGraph, self).__init__(*args, **kwargs)
+        g_ip = self.new_vertex_property("string")
+        self.vertex_properties["address"] = g_ip
+        g_fill_color = self.new_vertex_property("vector<double>")
+        self.vertex_properties["fill_color"] = g_fill_color
+        g_sig = self.new_edge_property("int")
+        self.edge_properties["sig"] = g_sig
+        self.ips_hash = {}
+        self.home_net = []
+        
+    def set_home_net(self, home_net):
+        self.home_net = [ipaddress.ip_network(ip_str) for ip_str in home_net]
+
+    def create_vertex(self, str_ip):
+        if str_ip in ips_hash:
+            vertex = ips_hash[str_ip]
+        else:
+            vertex = self.add_vertex()
+            self.vp.address[vertex] = str_ip
+            found = False
+            ip = ipaddress.ip_address(str_ip)
+            for net in self.home_net:
+                if not ip in net:
+                    continue
+                else:
+                    found = True
+                    break
+            if not found:
+                self.vp.fill_color[vertex] = [1, 0, 0, 1]
+            else:
+                self.vp.fill_color[vertex] = [0, 0, 1, 1]
+            self.vp.fill_color[vertex] = [0, 0, 1, 1]
+            ips_hash[str_ip] = vertex
+        return vertex
+
+    def create_edge(self, src, dest, event, args):
+        edges = self.edge(src, dest, all_edges = True)
+        if not len(edges):
+            edge = self.add_edge(src, dest)
+            self.ep.sig[edge] = event['alert']['signature_id']
+        else:
+            found = False
+            for edge in edges:
+                if self.edge_properties.sig[edge] == event['alert']['signature_id']:
+                    found = True
+                    break
+            if not found:
+                edge = self.add_edge(src, dest)
+                self.ep.sig[edge] = event['alert']['signature_id']
+
+    def handle_alert(self, event, args):
+        # get source and destination
+        found = False
+        if ':' in event['src_ip']:
+            return
+        #if event['alert']['signature_id'] in [2003068, 2013504]:
+        #if event['alert']['signature_id'] in [2013504]:
+        #    return
+        if not args.metadata:
+            src = self.create_vertex(str(ipaddress.ip_address(event['src_ip'])))
+            dest = self.create_vertex(str(ipaddress.ip_address(event['dest_ip'])))
+            self.create_edge(src, dest, event, args)
+        else:
+            if not 'source' in event['alert'] or not 'ip' in event['alert']['source']:
+                return
+            source_ip = str(ipaddress.ip_address(event['alert']['source']['ip']))
+            target_ip = str(ipaddress.ip_address(event['alert']['target']['ip']))
+            src = self.create_vertex(source_ip)
+            dest = self.create_vertex(target_ip)
+            self.create_edge(src, dest, event, args)
+
+
+def main_task(args):
+    setup_logging(args)
+    f = open(args.file, 'r')
+    if args.metadata:
+        g = AlertGraph()
+    else:
+        g = AlertGraph(directed = False)
+    g.set_home_net(HOME_NET_STR)
+    for line in f:
+        if not "alert" in line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.decoder.JSONDecodeError:
+            continue
+        if 'event_type' in event and event['event_type'] == 'alert':
+            g.handle_alert(event, args)
+
+    #graph_draw(g, vertex_text=g.vp.address, vertex_font_size=10, vertex_fill_color = g.vp.fill_color, output_size=(2000,2000), output="alerts.pdf")
+    #graph_draw(g, vertex_text=g.vertex_index, vertex_font_size=22, vertex_fill_color = g.vp.fill_color, output_size=(2000,2000), output="alerts-anonym.pdf")
+
+    #graph_draw(g, vertex_text=g.vp.address, vertex_font_size=10, vertex_fill_color = g.vp.fill_color) #, output_size=(2000,2000), output="alerts-anonym.pdf")
+    graph_draw(g, vertex_text=g.vertex_index, vertex_font_size=22, vertex_fill_color = g.vp.fill_color, output_size=(3000,3000), output="alerts-anonym.pdf")
+
+                
+main_task(args)
